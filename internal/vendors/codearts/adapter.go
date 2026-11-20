@@ -121,6 +121,22 @@ func Instances(env core.Env) []core.Vendor {
 	})}}
 }
 
+// TaskSpecs 注册 keepalive 定时任务族。
+//
+// STS security_token 只活 2 小时，而 keepalive 此前没有 codearts 侧的排程声明
+// （借道 workbuddy 的 spec 且 Manual:true 不进自动排程），实际只有管理面板被
+// 打开时才顺带触发——面板一关，token 过期，请求必 401「decrypt token fail」
+// （2026-11-20 实锤：14:05 刷新 → 19:47 请求落在过期空窗）。每 2 小时整点
+// 排程与 STS 有效期对齐，保活幂等（token 未到期刷新是 no-op）。
+func (v *adapter) TaskSpecs() []core.TaskSpec {
+	return []core.TaskSpec{{
+		Kind:         core.TaskKindKeepalive,
+		Label:        "Token 保活",
+		Description:  "刷新账号 STS 临时凭证（2h 有效期，对齐排程）",
+		DefaultHours: []int{0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22},
+	}}
+}
+
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	return LooksLikeCredential(raw, fileName, provider)
