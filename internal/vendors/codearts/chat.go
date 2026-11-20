@@ -115,6 +115,7 @@ func doCodeArtsRequest(ctx context.Context, baseURL string, req ChatRequest) (*h
 	}
 	httpReq.Header.Set("Agent-Type", "PromptCenter")
 	httpReq.Header.Set("User-Agent", "CodeArtsAgent/5.2.0")
+	applyChatSessionHeaders(httpReq, req.Body)
 	if req.Benefit {
 		// 必须放在签名之前：签名覆盖该头，晚设就不生效，
 		// 请求会被判成积分通道并按积分计费。
@@ -152,6 +153,36 @@ func doCodeArtsRequest(ctx context.Context, baseURL string, req ChatRequest) (*h
 }
 
 // signHuaweiRequest 为请求注入华为云 SDK-HMAC-SHA256 签名（签全部请求头）。
+// applyChatSessionHeaders 写入会话归并头（user-session-id / x-snap-traceid）。
+//
+// 华为网关按 user-session-id 归并"并发会话"（上限 3, code TM.00001041）：
+// 每个不同的 session-id 在服务端占一个槽, 完成后过 TTL 才释放。不带此头时
+// 每个请求都是独立匿名会话——agent 循环每轮工具调用算一个新会话, 3 轮就堆满,
+// 第 4 轮起持续 400（2026-11-20 实测: 无锚串行第 3 个即撞; 固定同值 8 连发全 200;
+// 官方客户端 agent-kernel 二进制含同名的头与 chat-session heartbeat/idle-release 配套逻辑）。
+//
+// 锚 = 请求体首条 message content 的 sha256 前 16 位: agent 会话内 system prompt
+// 逐字稳定（30 个实盘请求仅 3 个唯一哈希）, 跨会话/辅助请求自然区分。两个头同值,
+// 与官方客户端口径一致。头在签名之前设置（signSDKRequest 签全部实际存在的头）。
+func applyChatSessionHeaders(req *http.Request, body []byte) {
+	var payload struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || len(payload.Messages) == 0 {
+		return
+	}
+	first := payload.Messages[0].Content
+	if len(first) == 0 {
+		return
+	}
+	sum := sha256.Sum256(first)
+	sid := hex.EncodeToString(sum[:8])
+	req.Header.Set("user-session-id", sid)
+	req.Header.Set("x-snap-traceid", sid)
+}
+
 func signHuaweiRequest(req *http.Request, body []byte, cred *Credential) {
 	if cred.SecurityToken != "" {
 		req.Header.Set("X-Auth-Token", cred.SecurityToken)
