@@ -342,6 +342,11 @@ func prepareAgentBody(src []byte, cred *Credential) ([]byte, string, error) {
 			if !isMap {
 				continue
 			}
+			// 上游 role 枚举不含 developer（Codex responses 协议翻译产物），
+			// 实测 4027 拒收；语义等同 system。
+			if role, _ := m["role"].(string); role == "developer" {
+				m["role"] = "system"
+			}
 			if role, _ := m["role"].(string); role == "assistant" {
 				normalizeAgentAssistantToolCalls(m)
 			}
@@ -646,6 +651,11 @@ func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string
 			m, ok := mi.(map[string]any)
 			if !ok {
 				continue
+			}
+			// 上游 role 枚举不含 developer（Codex responses 协议翻译产物），
+			// 实测 4027 拒收；语义等同 system。
+			if role, _ := m["role"].(string); role == "developer" {
+				m["role"] = "system"
 			}
 			// TraeCode 的 ChatMessageData 用 content 块数组；字符串内容包一层。
 			content, present := m["content"]

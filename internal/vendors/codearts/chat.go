@@ -95,6 +95,8 @@ func doCodeArtsRequest(ctx context.Context, baseURL string, req ChatRequest) (*h
 		return nil, fmt.Errorf("codearts credential is nil")
 	}
 
+	req.Body = normalizeDeveloperRoles(req.Body)
+
 	target := strings.TrimRight(baseURL, "/")
 	if target == "" {
 		target = SnapEngineApiHost
@@ -181,6 +183,46 @@ func applyChatSessionHeaders(req *http.Request, body []byte) {
 	sid := hex.EncodeToString(sum[:8])
 	req.Header.Set("user-session-id", sid)
 	req.Header.Set("x-snap-traceid", sid)
+}
+
+// normalizeDeveloperRoles 把 messages 里的 developer 改写为 system：上游 role
+// 枚举只认 system/assistant/user/tool/function（Codex responses 协议翻译会产出
+// developer；trae 实测 4027 明确拒收，codearts 表现为空流）。只动 role 字段，
+// 其余字段原样透传；无 developer 时返回原 body 不做重序列化。
+func normalizeDeveloperRoles(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	rawMsgs, ok := payload["messages"]
+	if !ok {
+		return body
+	}
+	var msgs []map[string]json.RawMessage
+	if err := json.Unmarshal(rawMsgs, &msgs); err != nil {
+		return body
+	}
+	changed := false
+	for _, m := range msgs {
+		var role string
+		if json.Unmarshal(m["role"], &role) == nil && role == "developer" {
+			m["role"] = json.RawMessage(`"system"`)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	newMsgs, err := json.Marshal(msgs)
+	if err != nil {
+		return body
+	}
+	payload["messages"] = newMsgs
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func signHuaweiRequest(req *http.Request, body []byte, cred *Credential) {
