@@ -158,6 +158,30 @@ data: {"finish_reason":"stop"}
 
 `
 
+// agentToolShardFixture 锁定 agent 通道原生工具调用分片形态：旧形态 function_call
+// 键、分片 arguments 拆多事件下发、function_call 内带 namespace/partial_arguments 元数据。
+const agentToolShardFixture = `id: 1
+event: output
+data: {"response":"","reasoning_content":"需要查天气","tool_calls":null}
+
+id: 2
+event: output
+data: {"response":"","reasoning_content":null,"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function_call":{"name":"get_weather","arguments":"{\"city","namespace":"ns1","partial_arguments":"{\"city"}}]}
+
+id: 3
+event: output
+data: {"response":"","tool_calls":[{"index":0,"type":"function","function_call":{"name":"get_weather","arguments":"\":\"北京\"}"}}]}
+
+id: 4
+event: token_usage
+data: {"prompt_tokens":16,"completion_tokens":64,"total_tokens":80}
+
+id: 5
+event: done
+data: {"finish_reason":"stop"}
+
+`
+
 const catalogFixture = `{
   "allow_tenant_user_add_model": true,
   "config_info_list": [
@@ -230,14 +254,12 @@ const quotaFixture = `{
 
 // ---- 请求体 / 请求头 ----
 
-func TestPrepareBodyBuildsTraeCodeEnvelope(t *testing.T) {
-	cfg := ConfigFor(RegionCN)
-	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
+func TestPrepareAgentBodyBuildsEnvelope(t *testing.T) {
 	src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":false,"temperature":0.5}`)
 
-	body, model, errPrep := PrepareBody(src, cfg, resolved)
+	body, model, errPrep := prepareAgentBody(src, testCredential())
 	if errPrep != nil {
-		t.Fatalf("PrepareBody: %v", errPrep)
+		t.Fatalf("prepareAgentBody: %v", errPrep)
 	}
 	if model != "glm-5.2" {
 		t.Fatalf("model = %q, want glm-5.2", model)
@@ -253,20 +275,32 @@ func TestPrepareBodyBuildsTraeCodeEnvelope(t *testing.T) {
 	if got["model_name"] != "glm-5.2__dev" {
 		t.Errorf("model_name = %v, want glm-5.2__dev", got["model_name"])
 	}
-	if got["raw_chat_function"] != "chat_v3" {
-		t.Errorf("raw_chat_function = %v", got["raw_chat_function"])
+	if got["function"] != "solo_agent" {
+		t.Errorf("function = %v, want solo_agent", got["function"])
 	}
-	if got["config_source"] != float64(1) {
-		t.Errorf("config_source = %v", got["config_source"])
+	if got["mode"] != "FunctionCall" {
+		t.Errorf("mode = %v, want FunctionCall", got["mode"])
 	}
 	if got["stream"] != true {
 		t.Errorf("stream = %v, want true（上游只讲 SSE）", got["stream"])
 	}
-	if got["conversation_id"] == "" || got["conversation_id"] != got["session_id"] {
-		t.Errorf("conversation_id/session_id 不匹配: %v / %v", got["conversation_id"], got["session_id"])
+	if got["max_tokens"] != float64(agentDefaultMaxTokens) {
+		t.Errorf("max_tokens 缺省应兜底 %d: %v", agentDefaultMaxTokens, got["max_tokens"])
+	}
+	if got["conversation_id"] == "" || got["session_id"] == "" {
+		t.Errorf("conversation_id/session_id 缺失: %v / %v", got["conversation_id"], got["session_id"])
+	}
+	if got["conversation_id"] == got["session_id"] {
+		t.Error("agent 通道 conversation_id 与 session_id 应各自独立生成")
 	}
 	if _, ok := got["model"]; ok {
 		t.Error("顶层 model 字段应被删除（避免与 model_name 混淆）")
+	}
+	if got["user_id"] != "2487573687317868" {
+		t.Errorf("user_id 应取凭据 UID: %v", got["user_id"])
+	}
+	if got["prompt_max_tokens"] != float64(agentPromptMaxTokens) {
+		t.Errorf("prompt_max_tokens = %v", got["prompt_max_tokens"])
 	}
 	// 透传字段保留。
 	if got["temperature"] != 0.5 {
@@ -285,19 +319,44 @@ func TestPrepareBodyBuildsTraeCodeEnvelope(t *testing.T) {
 	}
 }
 
-// TestPrepareBodyNormalizesOpenAITools 锁定 tools 扁平化：
-// OpenAI 嵌套格式 [{type:"function", function:{...}}] 必须转为 Trae 扁平格式，
-// 否则 llm_raw_chat 网关直接 400（见 2026-11-01 spec）。
-func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
-	cfg := ConfigFor(RegionCN)
-	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
+// TestPrepareAgentBodyModelWire 锁定 agent 通道模型映射：表内模型按实证表
+// （含下划线变体），未收录模型按 name__dev 透传。
+func TestPrepareAgentBodyModelWire(t *testing.T) {
+	cases := map[string][2]string{
+		"deepseek-v4.1-flash":  {"deepseek-v4.1-flash", "deepseek-v4.1-flash__dev"},
+		"deepseek-v4-pro":      {"DeepSeek-V4-Pro", "deepseek_v4_pro__dev"},
+		"deepseek-v4-flash":    {"DeepSeek-V4-Flash", "deepseek_v4_flash__dev"},
+		"glm-5.3-flash":        {"glm-5.3-flash", "glm-5.3-flash__dev"},
+		"DeepSeek-V4-Pro":      {"DeepSeek-V4-Pro", "deepseek_v4_pro__dev"},
+		"brand-new-model":      {"brand-new-model", "brand-new-model__dev"},
+		"traecn-deepseek-v4.1-flash": {"deepseek-v4.1-flash", "deepseek-v4.1-flash__dev"},
+	}
+	for model, want := range cases {
+		src := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hi"}]}`)
+		body, _, errPrep := prepareAgentBody(src, nil)
+		if errPrep != nil {
+			t.Fatalf("%s: prepareAgentBody: %v", model, errPrep)
+		}
+		var got map[string]any
+		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+			t.Fatalf("%s: decode body: %v", model, errJSON)
+		}
+		if got["config_name"] != want[0] || got["model_name"] != want[1] {
+			t.Errorf("%s → (%v, %v), want (%s, %s)", model, got["config_name"], got["model_name"], want[0], want[1])
+		}
+	}
+}
+
+// TestPrepareAgentBodyNormalizesOpenAITools 锁定 tools 契约：保留 OpenAI 嵌套形态、
+// parameters 对象转 JSON 字符串（上游对对象形态报 4001）。
+func TestPrepareAgentBodyNormalizesOpenAITools(t *testing.T) {
 	src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[
 		{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{}}}}
-	]}`)
+	],"tool_choice":"auto"}`)
 
-	body, _, errPrep := PrepareBody(src, cfg, resolved)
+	body, _, errPrep := prepareAgentBody(src, nil)
 	if errPrep != nil {
-		t.Fatalf("PrepareBody: %v", errPrep)
+		t.Fatalf("prepareAgentBody: %v", errPrep)
 	}
 	var got map[string]any
 	if errJSON := json.Unmarshal(body, &got); errJSON != nil {
@@ -308,66 +367,93 @@ func TestPrepareBodyNormalizesOpenAITools(t *testing.T) {
 		t.Fatalf("tools 应为长度 1 的数组: %v", got["tools"])
 	}
 	tool, _ := tools[0].(map[string]any)
-	if _, hasType := tool["type"]; hasType {
-		t.Error("扁平格式不应保留外层 type 字段")
+	if tool["type"] != "function" {
+		t.Errorf("嵌套形态应保留外层 type 字段: %v", tool)
 	}
-	if _, hasFn := tool["function"]; hasFn {
-		t.Error("扁平格式不应保留 function 嵌套")
+	fn, okFn := tool["function"].(map[string]any)
+	if !okFn {
+		t.Fatalf("嵌套形态应保留 function 包装: %v", tool)
 	}
-	if tool["name"] != "get_weather" || tool["description"] != "查天气" {
-		t.Errorf("function 内字段未提升到根层级: %v", tool)
+	if fn["name"] != "get_weather" || fn["description"] != "查天气" {
+		t.Errorf("function 字段丢失: %v", fn)
 	}
-	params, okParams := tool["parameters"].(map[string]any)
-	if !okParams || params["type"] != "object" {
-		t.Errorf("parameters 未提升到根层级: %v", tool["parameters"])
+	params, isStr := fn["parameters"].(string)
+	if !isStr {
+		t.Fatalf("parameters 应转为 JSON 字符串（对象报 4001）: %T", fn["parameters"])
 	}
-	// content 块包装不受归一化影响。
-	msgs, _ := got["messages"].([]any)
-	first, _ := msgs[0].(map[string]any)
-	if _, okBlocks := first["content"].([]any); !okBlocks {
-		t.Errorf("content 块包装被破坏: %v", first["content"])
+	var paramsObj map[string]any
+	if errJSON := json.Unmarshal([]byte(params), &paramsObj); errJSON != nil || paramsObj["type"] != "object" {
+		t.Errorf("parameters 字符串内容不对: %q", params)
+	}
+	if got["tool_choice"] != "auto" {
+		t.Errorf("tool_choice = %v, want auto", got["tool_choice"])
 	}
 }
 
-// 已是扁平格式的 tools 必须原样保留（幂等，向后兼容 Trae 官方客户端直发）。
-func TestPrepareBodyKeepsFlatTools(t *testing.T) {
-	cfg := ConfigFor(RegionCN)
-	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
+// 已是扁平格式（无 function 包装）的 tools 条目必须丢弃——llm_utils_chat 只认嵌套形态。
+func TestPrepareAgentBodyDropsFlatTools(t *testing.T) {
 	src := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[
 		{"name":"get_weather","description":"查天气","parameters":{"type":"object"}}
 	]}`)
 
-	body, _, errPrep := PrepareBody(src, cfg, resolved)
+	body, _, errPrep := prepareAgentBody(src, nil)
 	if errPrep != nil {
-		t.Fatalf("PrepareBody: %v", errPrep)
+		t.Fatalf("prepareAgentBody: %v", errPrep)
 	}
 	var got map[string]any
 	if errJSON := json.Unmarshal(body, &got); errJSON != nil {
 		t.Fatalf("decode body: %v", errJSON)
 	}
-	tools, _ := got["tools"].([]any)
-	if len(tools) != 1 {
-		t.Fatalf("tools 长度 = %d, want 1", len(tools))
+	if _, present := got["tools"]; present {
+		t.Errorf("全扁平 tools 应整体移除: %v", got["tools"])
 	}
-	tool, _ := tools[0].(map[string]any)
-	if tool["name"] != "get_weather" || tool["description"] != "查天气" {
-		t.Errorf("扁平 tools 被改写: %v", tool)
+}
+
+// assistant 历史 tool_calls 改回上游旧形态 function_call 键；tool_choice=none 撤 tools。
+func TestPrepareAgentBodyAssistantToolCallsAndChoiceNone(t *testing.T) {
+	src := []byte(`{"model":"glm-5.2","messages":[
+		{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"}}]},
+		{"role":"tool","content":"data"},
+		{"role":"user","content":"继续"}
+	],"tools":[{"type":"function","function":{"name":"Read","description":"读文件","parameters":{}}}],"tool_choice":"none"}`)
+
+	body, _, errPrep := prepareAgentBody(src, nil)
+	if errPrep != nil {
+		t.Fatalf("prepareAgentBody: %v", errPrep)
+	}
+	var got map[string]any
+	if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+		t.Fatalf("decode body: %v", errJSON)
+	}
+	if _, present := got["tools"]; present {
+		t.Errorf("tool_choice=none 应撤掉 tools: %v", got["tools"])
+	}
+	if _, present := got["tool_choice"]; present {
+		t.Errorf("tool_choice=none 应删除 tool_choice 字段")
+	}
+	msgs, _ := got["messages"].([]any)
+	assistant, _ := msgs[0].(map[string]any)
+	tcs, _ := assistant["tool_calls"].([]any)
+	tc, _ := tcs[0].(map[string]any)
+	if _, has := tc["function"]; has {
+		t.Errorf("assistant tool_calls 应改回 function_call 旧形态: %v", tc)
+	}
+	fc, _ := tc["function_call"].(map[string]any)
+	if fc == nil || fc["name"] != "Read" {
+		t.Errorf("function_call 内容不对: %v", tc)
 	}
 }
 
 // 未传 tools / tools 为空数组时必须零改动。
-func TestPrepareBodyLeavesMissingOrEmptyTools(t *testing.T) {
-	cfg := ConfigFor(RegionCN)
-	resolved := ResolvedModel{ConfigName: "glm-5.2", WireName: "glm-5.2__dev"}
-
+func TestPrepareAgentBodyLeavesMissingOrEmptyTools(t *testing.T) {
 	for name, src := range map[string][]byte{
 		"无tools":   []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`),
 		"空tools":   []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[]}`),
 		"非数组tools": []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":null}`),
 	} {
-		body, _, errPrep := PrepareBody(src, cfg, resolved)
+		body, _, errPrep := prepareAgentBody(src, nil)
 		if errPrep != nil {
-			t.Fatalf("%s: PrepareBody: %v", name, errPrep)
+			t.Fatalf("%s: prepareAgentBody: %v", name, errPrep)
 		}
 		var got map[string]any
 		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
@@ -381,8 +467,123 @@ func TestPrepareBodyLeavesMissingOrEmptyTools(t *testing.T) {
 	}
 }
 
+// TestPrepareAgentBodyMaxTokensRespectsExplicit 锁定显式 max_tokens 优先、
+// max_completion_tokens 兼容。
+func TestPrepareAgentBodyMaxTokensRespectsExplicit(t *testing.T) {
+	for name, src := range map[string][]byte{
+		"max_tokens":          []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"max_tokens":123}`),
+		"max_completion":      []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":456}`),
+		"零值回落兜底":              []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"max_tokens":0}`),
+	} {
+		body, _, errPrep := prepareAgentBody(src, nil)
+		if errPrep != nil {
+			t.Fatalf("%s: prepareAgentBody: %v", name, errPrep)
+		}
+		var got map[string]any
+		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+			t.Fatalf("%s: decode body: %v", name, errJSON)
+		}
+		want := float64(agentDefaultMaxTokens)
+		switch name {
+		case "max_tokens":
+			want = 123
+		case "max_completion":
+			want = 456
+		}
+		if got["max_tokens"] != want {
+			t.Errorf("%s: max_tokens = %v, want %v", name, got["max_tokens"], want)
+		}
+	}
+}
+
+// 标准 OpenAI reasoning_effort → wire reasoning_effort_level 在插件内转换；
+// 已显式带 reasoning_effort_level 的不覆盖；原字段撤掉不透传上游。
+func TestPrepareAgentBodyNormalizesEffort(t *testing.T) {
+	run := func(src string) map[string]any {
+		body, _, errPrep := prepareAgentBody([]byte(src), nil)
+		if errPrep != nil {
+			t.Fatalf("prepareAgentBody: %v", errPrep)
+		}
+		var got map[string]any
+		if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+			t.Fatalf("decode body: %v", errJSON)
+		}
+		return got
+	}
+	cases := map[string]string{
+		"max":     "extra_high",
+		"xhigh":   "extra_high",
+		"high":    "high",
+		"medium":  "high",
+		"low":     "light",
+		"minimal": "light",
+		"none":    "light",
+		"MAX":     "extra_high",
+	}
+	for effort, want := range cases {
+		got := run(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"` + effort + `"}`)
+		if got["reasoning_effort_level"] != want {
+			t.Errorf("reasoning_effort=%s → wire %v, want %s", effort, got["reasoning_effort_level"], want)
+		}
+		if _, present := got["reasoning_effort"]; present {
+			t.Errorf("reasoning_effort=%s：标准字段应撤掉不透传上游", effort)
+		}
+	}
+	// 显式 wire 档位优先，不被标准字段覆盖。
+	got := run(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max","reasoning_effort_level":"light"}`)
+	if got["reasoning_effort_level"] != "light" {
+		t.Errorf("显式 reasoning_effort_level 应保留: %v", got["reasoning_effort_level"])
+	}
+	// 两字段都没有时不注入。
+	got = run(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)
+	if _, present := got["reasoning_effort_level"]; present {
+		t.Errorf("未请求档位不应注入 reasoning_effort_level: %v", got["reasoning_effort_level"])
+	}
+}
+
+// agent 通道请求头：鉴权仅 x-ide-token 裸 JWT（无 Authorization），IDE 版本用
+// agent 通道实证值，UA 与 referer 对齐 TraeWorkAssistant。
+func TestApplyAgentHeadersSetsAgentIdentity(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	applyAgentHeaders(req, testCredential(), true)
+
+	want := map[string]string{
+		"X-Ide-Token":          "test-access-token",
+		"X-App-Id":             AppID,
+		"X-App-Version":        "default",
+		"X-App-Version-Code":   AgentIDEVersionCode,
+		"X-Ide-Version":        AgentIDEVersion,
+		"X-Ide-Version-Code":   AgentIDEVersionCode,
+		"X-Ide-Version-Type":   "stable",
+		"X-Device-Type":        "windows",
+		"X-Device-Brand":       "CREFG-XX",
+		"X-Os-Version":         "Windows 11 Home China",
+		"Package-Type":         "stable_cn",
+		"X-Lgw-Req-Sdk-Type":   "3",
+		"X-Lscbd-Aid":          "787976",
+		"X-Ss-Dp":              "787976",
+		"App-Version":          AgentIDEVersion,
+		"User-Agent":           "TraeClient/TTNet",
+		"Accept":               "text/event-stream",
+		"Request-Traffic-Type": "prod",
+		"Referer":              HostChatCN + EpAgentChat,
+	}
+	for key, value := range want {
+		if got := req.Header.Get(key); got != value {
+			t.Errorf("header %s = %q, want %q", key, got, value)
+		}
+	}
+	if req.Header.Get("Authorization") != "" {
+		t.Error("agent 通道不应带 Authorization 头（x-ide-token 裸 JWT 鉴权）")
+	}
+	if req.Header.Get("X-Request-Id") == "" || req.Header.Get("X-Tt-Trace-Id") == "" {
+		t.Error("trace 头未设置")
+	}
+}
+
+// 国际版 raw_chat 路径的 IDE 请求头契约保持不变。
 func TestApplyTraeHeadersSetsIDEIdentity(t *testing.T) {
-	cfg := ConfigFor(RegionCN)
+	cfg := ConfigFor(RegionGlobal)
 	cred := testCredential()
 	req, _ := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	ApplyTraeHeaders(req, cred, cfg, true)
@@ -393,8 +594,8 @@ func TestApplyTraeHeadersSetsIDEIdentity(t *testing.T) {
 		"X-Ide-Token":          "test-access-token",
 		"X-App-Id":             AppID,
 		"X-App-Version":        "default",
-		"X-Ide-Version":        IDEVersionCN,
-		"X-Ide-Version-Code":   IDEVersionCodeCN,
+		"X-Ide-Version":        IDEVersionGlobal,
+		"X-Ide-Version-Code":   IDEVersionCodeGlobal,
 		"X-Ide-Version-Type":   "stable",
 		"X-App-Function":       "chat_v3",
 		"X-Ide-Function":       "chat_v3",
@@ -430,9 +631,7 @@ func TestChatAggregatesSSEIntoOpenAIResponse(t *testing.T) {
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case EpModels:
-			_, _ = w.Write([]byte(catalogFixture))
-		case EpChat:
+		case EpAgentChat:
 			raw, _ := io.ReadAll(r.Body)
 			_ = json.Unmarshal(raw, &gotBody)
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -453,12 +652,15 @@ func TestChatAggregatesSSEIntoOpenAIResponse(t *testing.T) {
 		t.Fatalf("Chat: %v", errChat)
 	}
 
-	// 请求体走 TraeCode 协议。
+	// 请求体走 agent 通道协议。
 	if gotBody["model_name"] != "glm-5.2__dev" {
 		t.Errorf("上游收到的 model_name = %v", gotBody["model_name"])
 	}
-	if gotBody["raw_chat_function"] != "chat_v3" {
-		t.Errorf("上游收到的 raw_chat_function = %v", gotBody["raw_chat_function"])
+	if gotBody["function"] != "solo_agent" {
+		t.Errorf("上游收到的 function = %v", gotBody["function"])
+	}
+	if gotBody["mode"] != "FunctionCall" {
+		t.Errorf("上游收到的 mode = %v", gotBody["mode"])
 	}
 
 	var got map[string]any
@@ -489,15 +691,12 @@ func TestChatAggregatesSSEIntoOpenAIResponse(t *testing.T) {
 func TestChatStreamEmitsOpenAIChunks(t *testing.T) {
 	stubHost(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case EpModels:
-			_, _ = w.Write([]byte(catalogFixture))
-		case EpChat:
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte(chatSSEFixture))
-		default:
+		if r.URL.Path != EpAgentChat {
 			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(chatSSEFixture))
 	}))
 	defer server.Close()
 	cfg := testConfig(t, server.URL)
@@ -529,18 +728,120 @@ func TestChatStreamEmitsOpenAIChunks(t *testing.T) {
 	}
 }
 
+// 原生 tool_calls 分片：流式透传为 OpenAI delta（function_call 改回 function、
+// namespace/partial_arguments 剔除），收尾帧 finish_reason 升级 tool_calls。
+func TestChatStreamEmitsNativeToolCallShards(t *testing.T) {
+	stubHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != EpAgentChat {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(agentToolShardFixture))
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	var chunks []string
+	errStream := ChatStream(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"天气如何"}]}`),
+	}, func(chunk []byte) error {
+		chunks = append(chunks, string(chunk))
+		return nil
+	})
+	if errStream != nil {
+		t.Fatalf("ChatStream: %v", errStream)
+	}
+	joined := strings.Join(chunks, "")
+	if !strings.Contains(joined, `"tool_calls"`) {
+		t.Error("chunk 缺少 tool_calls 增量")
+	}
+	if !strings.Contains(joined, `"name":"get_weather"`) {
+		t.Error("tool_calls 缺少函数名")
+	}
+	if strings.Contains(joined, `"function_call"`) {
+		t.Error("下游应输出 OpenAI function 形态，不应残留 function_call 键")
+	}
+	if strings.Contains(joined, "namespace") || strings.Contains(joined, "partial_arguments") {
+		t.Error("分片元数据 namespace/partial_arguments 未剔除")
+	}
+	if !strings.Contains(joined, `"finish_reason":"tool_calls"`) {
+		t.Errorf("出现 tool_calls 时收尾帧应升级为 tool_calls: %s", joined)
+	}
+}
+
+// 非流式聚合：分片按 index 槽位合并（arguments 追加），finish_reason 补 tool_calls。
+func TestChatAggregatesToolCallShards(t *testing.T) {
+	stubHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != EpAgentChat {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(agentToolShardFixture))
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	body, errChat := Chat(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"天气如何"}]}`),
+	})
+	if errChat != nil {
+		t.Fatalf("Chat: %v", errChat)
+	}
+
+	var got map[string]any
+	if errJSON := json.Unmarshal(body, &got); errJSON != nil {
+		t.Fatalf("decode response: %v", errJSON)
+	}
+	choices, _ := got["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+	tcs, okTcs := message["tool_calls"].([]any)
+	if !okTcs || len(tcs) != 1 {
+		t.Fatalf("tool_calls 应合并为 1 条: %v", message["tool_calls"])
+	}
+	tc, _ := tcs[0].(map[string]any)
+	if tc["id"] != "call_abc123" || tc["type"] != "function" {
+		t.Errorf("id/type 应由首片带全: %v", tc)
+	}
+	if _, hasIdx := tc["index"]; hasIdx {
+		t.Error("非流式 tool_calls 不应输出 index 字段")
+	}
+	fn, _ := tc["function"].(map[string]any)
+	if fn == nil || fn["name"] != "get_weather" {
+		t.Fatalf("function.name 不对: %v", fn)
+	}
+	if fn["arguments"] != `{"city":"北京"}` {
+		t.Errorf("arguments 应跨分片拼接: %v", fn["arguments"])
+	}
+	if _, hasNs := fn["namespace"]; hasNs {
+		t.Error("namespace 元数据未剔除")
+	}
+	usage, _ := got["usage"].(map[string]any)
+	if usage["total_tokens"] != float64(80) {
+		t.Errorf("usage.total_tokens = %v", usage["total_tokens"])
+	}
+}
+
 func TestChatSurfacesUpstreamErrorEvent(t *testing.T) {
 	stubHost(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case EpModels:
-			_, _ = w.Write([]byte(catalogFixture))
-		case EpChat:
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("event: error\ndata: {\"code\":4023,\"message\":\"the model is unknown\"}\n\n"))
-		default:
+		if r.URL.Path != EpAgentChat {
 			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: error\ndata: {\"code\":4023,\"message\":\"the model is unknown\"}\n\n"))
 	}))
 	defer server.Close()
 	cfg := testConfig(t, server.URL)
@@ -555,27 +856,6 @@ func TestChatSurfacesUpstreamErrorEvent(t *testing.T) {
 	}
 	if !strings.Contains(errChat.Error(), "4023") {
 		t.Errorf("错误信息未带上游码: %v", errChat)
-	}
-}
-
-func TestChatRejectsModelOutsideCatalog(t *testing.T) {
-	stubHost(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(catalogFixture))
-	}))
-	defer server.Close()
-	cfg := testConfig(t, server.URL)
-
-	_, errChat := Chat(context.Background(), "", ChatRequest{
-		Credential: testCredential(),
-		Profile:    cfg,
-		Body:       []byte(`{"model":"not-a-model","messages":[{"role":"user","content":"hi"}]}`),
-	})
-	if errChat == nil {
-		t.Fatal("目录外的模型应报错")
-	}
-	if !strings.Contains(errChat.Error(), "not-a-model") {
-		t.Errorf("错误信息应点名模型: %v", errChat)
 	}
 }
 
