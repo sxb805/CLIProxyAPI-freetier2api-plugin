@@ -379,6 +379,10 @@ func (v *adapter) LocalCallbackHint() string {
 // 命中即换票落盘。插件与浏览器不在同一台机器时回调打不到这里，用户从
 // 浏览器地址栏复制整条链接走 SubmitCallback，两条路共用 completeLogin。
 func (v *adapter) startLoginCatcher(state string) {
+	// 新发起的登录接管回调端口：旧监听（上次未走完的尝试，无超时清理）还挂着时，
+	// 新授权回调会带着新 state 撞旧 catcher，必然报 state 校验失败（2026-11-15 实锤）。
+	// 故先停旧监听再起；被顶掉的旧会话仍可走控制台粘贴链接兜底（不经过 catcher）。
+	StopCallbackCatcher()
 	sessionID := VendorID + "_" + state
 	StartCallbackCatcher(state, func(code, callbackState string) (string, error) {
 		session, pollState := v.Env.Logins.Poll(sessionID)
