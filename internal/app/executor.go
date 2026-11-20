@@ -123,124 +123,10 @@ func (a *App) handleExecutorExecuteStream(request []byte) ([]byte, error) {
 //
 // 解析失败时原样返回：宁可不改写，也不要让一次对话因为本地 JSON 解析失败而中断——
 // 上游的真实报错比本地解析错误更有诊断价值（与 workbuddy.PrepareBody 同口径）。
-//
-// 实现上先走「定位顶层 model 值再原地拼接」的快路径（见 spliceModelValue）：
-// 请求体里唯一需要变的就是那一个字符串值，整份解成 map 再序列化一遍纯属浪费，
-// 而且 map 往返会把所有数字过成 float64（超过 2^53 的整数静默失真）、重排字段
-// 顺序。64KB 上下文实测 885µs → 11µs，大上下文下直接压在首字节延迟上。
-// 结构不合常规（没有顶层 model / model 不是字符串 / 值需要转义 / 非法 JSON）时
-// 回落到原来的整份改写，行为与旧实现完全一致。
 func rewritePayloadModel(payload []byte, model string) []byte {
 	if len(payload) == 0 || strings.TrimSpace(model) == "" {
 		return payload
 	}
-	if encoded, okSplice := spliceModelValue(payload, model); okSplice {
-		return encoded
-	}
-	return rewritePayloadModelRoundTrip(payload, model)
-}
-
-// spliceModelValue 在顶层把 "model" 的字符串值原地替换成 model。
-//
-// 返回 ok=false 表示「这个请求体不适合原地拼接」，由调用方回落到整份改写。
-// 只认顶层（depth==1）的 model 键：messages / tools 里嵌套的同名键不能碰。
-func spliceModelValue(payload []byte, model string) ([]byte, bool) {
-	// 目标值里有需要转义的字符时不做拼接：那要把值按 JSON 转义规则处理，
-	// 交给整份改写更稳。模型 ID 实际上都是安全字符，这里只是兜底。
-	if strings.ContainsAny(model, "\"\\\n\r\t") {
-		return nil, false
-	}
-	n := len(payload)
-	i := 0
-	for i < n && isJSONSpace(payload[i]) {
-		i++
-	}
-	if i >= n || payload[i] != '{' {
-		return nil, false
-	}
-	depth := 0
-	for i < n {
-		switch payload[i] {
-		case '{', '[':
-			depth++
-			i++
-		case '}', ']':
-			depth--
-			i++
-		case '"':
-			start := i
-			i++
-			for i < n {
-				if payload[i] == '\\' {
-					i += 2
-					continue
-				}
-				if payload[i] == '"' {
-					i++
-					break
-				}
-				i++
-			}
-			if i > n {
-				return nil, false
-			}
-			if depth != 1 || !bytes.Equal(payload[start+1:i-1], []byte("model")) {
-				continue
-			}
-			// 跳过空白找冒号：冒号在说明这是键；否则这个 "model" 是字符串值，
-			// 不是我们要改的位置。
-			j := i
-			for j < n && isJSONSpace(payload[j]) {
-				j++
-			}
-			if j >= n || payload[j] != ':' {
-				continue
-			}
-			j++
-			for j < n && isJSONSpace(payload[j]) {
-				j++
-			}
-			if j >= n || payload[j] != '"' {
-				// model 的值不是字符串（null / 数字 / 对象）：交给整份改写。
-				return nil, false
-			}
-			k := j + 1
-			for k < n {
-				if payload[k] == '\\' {
-					k += 2
-					continue
-				}
-				if payload[k] == '"' {
-					k++
-					break
-				}
-				k++
-			}
-			if k > n {
-				return nil, false
-			}
-			out := make([]byte, 0, len(payload)+len(model)+2)
-			out = append(out, payload[:j]...)
-			out = append(out, '"')
-			out = append(out, model...)
-			out = append(out, '"')
-			out = append(out, payload[k:]...)
-			return out, true
-		default:
-			i++
-		}
-	}
-	return nil, false
-}
-
-func isJSONSpace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
-}
-
-// rewritePayloadModelRoundTrip 是慢路径：整份解成 map、改值、再序列化。
-//
-// 只在 spliceModelValue 判不出安全切点时使用（少见），语义与历史实现一致。
-func rewritePayloadModelRoundTrip(payload []byte, model string) []byte {
 	var obj map[string]any
 	if errUnmarshal := json.Unmarshal(payload, &obj); errUnmarshal != nil || obj == nil {
 		return payload
@@ -453,22 +339,13 @@ func (a *App) handleExecutorHTTPRequest(request []byte) ([]byte, error) {
 }
 
 // emitStreamChunk 把一段载荷推给宿主流。
-// streamEmitRequest 是 host.stream.emit 的请求体。
-//
-// 用结构体而不是 map[string]any：每帧都要序列化一次，map 要现建、反射遍历、
-// 9 次分配；结构体 1 次分配，单帧序列化耗时减半（见 TestStreamEmitPayloadBench）。
-type streamEmitRequest struct {
-	StreamID string `json:"stream_id"`
-	Payload  []byte `json:"payload"`
-}
-
 func emitStreamChunk(callbackID, streamID string, payload []byte) error {
 	if strings.TrimSpace(streamID) == "" {
 		return fmt.Errorf("stream id is missing")
 	}
-	_, errCall := hostbridge.Call(callbackID, pluginabi.MethodHostStreamEmit, &streamEmitRequest{
-		StreamID: streamID,
-		Payload:  payload,
+	_, errCall := hostbridge.Call(callbackID, pluginabi.MethodHostStreamEmit, map[string]any{
+		"stream_id": streamID,
+		"payload":   payload,
 	})
 	if errCall != nil {
 		logger.Debug("推送流数据失败：%v", errCall)
