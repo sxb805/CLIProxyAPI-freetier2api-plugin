@@ -2,6 +2,7 @@ package codearts
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -224,5 +225,28 @@ func TestSubmitCallbackSurfacesUpstreamNote(t *testing.T) {
 	}
 	if result.RedirectURL == "" {
 		t.Fatal("pending 时仍需带回门户登录地址")
+	}
+}
+
+// 登录票据不返回用户身份时必须能从 refresh_token 的 user_profile 里取，
+// 否则多账号会共用 "codearts-user" 文件名互相覆盖。
+func TestAccountFromRefreshToken(t *testing.T) {
+	profile := base64.RawURLEncoding.EncodeToString([]byte(
+		`{"account_id":"01a1fc23615a7e73a2626361e78254e7","account_name":"hw063830472395906","principal_is_root_user":true}`))
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"user_profile":"` + profile + `","type":"refreshToken"}`))
+	token := "eyJ0eXAiOiJKV1QiLCJh." + claims + ".signature"
+
+	name, id := accountFromRefreshToken(token)
+	if name != "hw063830472395906" {
+		t.Fatalf("account_name = %q", name)
+	}
+	if id != "01a1fc23615a7e73a2626361e78254e7" {
+		t.Fatalf("account_id = %q", id)
+	}
+
+	for _, bad := range []string{"", "garbage", "a.b"} {
+		if n, i := accountFromRefreshToken(bad); n != "" || i != "" {
+			t.Fatalf("%q: 期望空结果，得到 %q %q", bad, n, i)
+		}
 	}
 }

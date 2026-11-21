@@ -148,7 +148,13 @@ func pollLoginTicket(ctx context.Context, logins core.LoginSessions, sessionID s
 
 // successResponse 把票据/令牌返回的凭证转成宿主认识的登录成功响应。
 func successResponse(creds *ticketCredentials, pending *pendingLogin) *pluginapi.AuthLoginPollResponse {
-	uid := core.FirstNonEmpty(creds.UserID, creds.UserName, "codearts-user")
+	// 登录票据接口不返回 user_name/user_id（实测为空），只看 creds 会让所有账号
+	// 都回落到同一个 "codearts-user" 文件名，第二个账号登录时覆盖第一个
+	// （2026-11-21 实锤：添加第二个账号后旧账号凭证文件被原地覆盖）。
+	// refresh_token 是 JWT，user_profile 里有 account_name/account_id，用它区分。
+	accountName, accountID := accountFromRefreshToken(creds.RefreshToken)
+	uid := core.FirstNonEmpty(creds.UserID, creds.UserName, accountName, accountID,
+		"codearts-user-"+core.RandomHex(4))
 	expiresAt := parseExpiration(creds.Expiration)
 	if expiresAt == 0 {
 		expiresAt = time.Now().Add(12 * time.Hour).Unix()
@@ -183,6 +189,38 @@ func successResponse(creds *ticketCredentials, pending *pendingLogin) *pluginapi
 			StorageJSON: storageJSON,
 		},
 	}
+}
+
+// accountFromRefreshToken 从 refresh_token(JWT) 的 user_profile 里取账号身份。
+// user_profile 是 base64 的 JSON：{"account_name":"hw063830...","account_id":"01a1..."}。
+// 解析失败时返回空串，由调用方回落到随机后缀（宁可多一条重名账号，也不能覆盖他人）。
+func accountFromRefreshToken(token string) (name, id string) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 || parts[1] == "" {
+		return "", ""
+	}
+	payload, errPayload := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if errPayload != nil {
+		return "", ""
+	}
+	var claims struct {
+		UserProfile string `json:"user_profile"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.UserProfile == "" {
+		return "", ""
+	}
+	profile, errProfile := base64.RawURLEncoding.DecodeString(strings.TrimRight(claims.UserProfile, "="))
+	if errProfile != nil {
+		return "", ""
+	}
+	var info struct {
+		AccountName string `json:"account_name"`
+		AccountID   string `json:"account_id"`
+	}
+	if json.Unmarshal(profile, &info) != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(info.AccountName), strings.TrimSpace(info.AccountID)
 }
 
 // ticketCredentials 是登录票据或令牌接口返回的临时凭证。
