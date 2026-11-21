@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -199,47 +200,71 @@ func describeFailure(err error) string {
 }
 
 // checkinCreditActivity 只处理积分签到，不决定是否领取免费模型福利。
+//
+// 每日登录类活动可能同时存在多条（2026-11-21 实测：每日签到 100 分 + 赛事
+// 每日签到礼 1000 分，且已确认的旧赛事活动排在列表第一），因此领取全部
+// claimable 的 USER_LOGIN 条目；只在一条都不可领时才按状态判「已领取/不可领」。
 func checkinCreditActivity(ctx context.Context, cred *Credential) (*CheckinResult, error) {
-	activity, errActivity := fetchDailyActivity(ctx, cred)
+	activities, errActivity := fetchDailyActivities(ctx, cred)
 	if errActivity != nil {
 		return nil, errActivity
 	}
-	if activity == nil {
+	if len(activities) == 0 {
 		return &CheckinResult{NotRecorded: true, Message: "未找到每日签到活动"}, nil
 	}
-	if !activity.Claimable {
+
+	var total int64
+	claimed := 0
+	var failures []string
+	for _, activity := range activities {
+		if !activity.Claimable || activity.CampaignID == "" {
+			continue
+		}
+		claim, errClaim := claimOps(ctx, cred, activity.CampaignID)
+		if errClaim != nil {
+			failures = append(failures, describeFailure(errClaim))
+			continue
+		}
+		// 服务端要求确认时才补 confirm（判据：响应 data.id 非空）。确认失败不改变
+		// 「已领取」的事实：积分已进入待确认态，报失败会让用户重复点击。
+		if claim.benefitID != "" {
+			confirmBody, _ := json.Marshal(map[string]any{"campaignId": campaignIDValue(activity.CampaignID)})
+			_, _ = signedSnapJSON(ctx, http.MethodPost, SnapEngineApiHost+EpOpsConfirm, cred, confirmBody)
+		}
+		credit := claim.credit
+		if credit == 0 {
+			credit = activity.Amount
+		}
+		total += credit
+		claimed++
+	}
+
+	if claimed > 0 {
+		message := "签到成功"
+		if total > 0 {
+			message = fmt.Sprintf("签到成功 +%d 积分", total)
+		}
+		if len(failures) > 0 {
+			message += "（部分活动领取失败：" + strings.Join(failures, "；") + "）"
+		}
+		return &CheckinResult{Credit: total, Message: message}, nil
+	}
+	if len(failures) > 0 {
+		return nil, fmt.Errorf("签到领取失败: %s", strings.Join(failures, "；"))
+	}
+
+	// 一条都不可领：有已领取记录就算今天已领，否则如实报告不可领状态。
+	var statuses []string
+	for _, activity := range activities {
 		if claimedStatuses[strings.ToUpper(activity.Status)] {
 			return &CheckinResult{Already: true, Message: "今天已领取"}, nil
 		}
-		return &CheckinResult{
-			NotRecorded: true,
-			Message:     fmt.Sprintf("当前不可领取（status=%s）", activity.Status),
-		}, nil
+		statuses = append(statuses, activity.Status)
 	}
-	if activity.CampaignID == "" {
-		return nil, fmt.Errorf("签到活动缺少 campaignId，无法领取")
-	}
-
-	claim, errClaim := claimOps(ctx, cred, activity.CampaignID)
-	if errClaim != nil {
-		return nil, errClaim
-	}
-	// 服务端要求确认时才补 confirm（判据：响应 data.id 非空）。确认失败不改变
-	// 「已领取」的事实：积分已进入待确认态，报失败会让用户重复点击。
-	if claim.benefitID != "" {
-		_, _ = signedSnapJSON(ctx, http.MethodPost, SnapEngineApiHost+EpOpsConfirm, cred,
-			[]byte(`{"campaignId":"`+jsonEscape(activity.CampaignID)+`"}`))
-	}
-
-	credit := claim.credit
-	if credit == 0 {
-		credit = activity.Amount
-	}
-	message := "签到成功"
-	if credit > 0 {
-		message = fmt.Sprintf("签到成功 +%d 积分", credit)
-	}
-	return &CheckinResult{Credit: credit, Message: message}, nil
+	return &CheckinResult{
+		NotRecorded: true,
+		Message:     fmt.Sprintf("当前不可领取（status=%s）", strings.Join(statuses, ",")),
+	}, nil
 }
 
 // opsClaimResult 是一次领取响应的关键字段。
@@ -251,7 +276,7 @@ type opsClaimResult struct {
 // claimOps 调用 /v1/ops/claim，body 与官方客户端逐字节一致。
 func claimOps(ctx context.Context, cred *Credential, campaignID string) (*opsClaimResult, error) {
 	body, _ := json.Marshal(map[string]any{
-		"campaignId":    campaignID,
+		"campaignId":    campaignIDValue(campaignID),
 		"idempotentKey": core.RandomHex(16),
 		"channel":       OpsChannel,
 	})
@@ -284,18 +309,20 @@ func fetchAccountInfo(ctx context.Context, cred *Credential) (*accountInfo, erro
 	return &info, nil
 }
 
-// fetchDailyActivity 查询活动列表并挑出每日登录领取条目。
-func fetchDailyActivity(ctx context.Context, cred *Credential) (*opsActivity, error) {
+// fetchDailyActivities 查询活动列表并返回全部每日登录领取条目。
+// 每日登录类活动可能不止一条（主签到 + 赛事签到礼），签到侧全部处理。
+func fetchDailyActivities(ctx context.Context, cred *Credential) ([]*opsActivity, error) {
 	activities, errFetch := fetchOpsActivities(ctx, cred)
 	if errFetch != nil {
 		return nil, errFetch
 	}
+	var daily []*opsActivity
 	for _, activity := range activities {
 		if activity.Type == OpsDailyLoginType {
-			return activity, nil
+			daily = append(daily, activity)
 		}
 	}
-	return nil, nil
+	return daily, nil
 }
 
 // fetchOpsActivities 拉取活动列表全部条目。签到只吃每日登录那一条，
@@ -416,6 +443,16 @@ func identifier(source map[string]any, key string) string {
 		return value.String()
 	}
 	return ""
+}
+
+// campaignIDValue 按数值形态还原 campaignId 的 JSON 类型：纯数字回传为数字。
+// 官方客户端把活动列表里的数字原样回传，字符串化后的 "34" 可能被上游按
+// 非法参数拒收（2026-11-21 实测数字形态领取成功）。
+func campaignIDValue(id string) any {
+	if parsed, errParse := strconv.ParseInt(strings.TrimSpace(id), 10, 64); errParse == nil {
+		return parsed
+	}
+	return id
 }
 
 // firstInt 按候选键顺序取第一个非零整数（兼容数字字符串）。
