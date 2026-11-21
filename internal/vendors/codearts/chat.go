@@ -95,7 +95,7 @@ func doCodeArtsRequest(ctx context.Context, baseURL string, req ChatRequest) (*h
 		return nil, fmt.Errorf("codearts credential is nil")
 	}
 
-	req.Body = normalizeDeveloperRoles(req.Body)
+	req.Body = normalizeRequestBody(req.Body)
 
 	target := strings.TrimRight(baseURL, "/")
 	if target == "" {
@@ -185,41 +185,57 @@ func applyChatSessionHeaders(req *http.Request, body []byte) {
 	req.Header.Set("x-snap-traceid", sid)
 }
 
-// normalizeDeveloperRoles 把 messages 里的 developer 改写为 system：上游 role
-// 枚举只认 system/assistant/user/tool/function（Codex responses 协议翻译会产出
-// developer；trae 实测 4027 明确拒收，codearts 表现为空流）。只动 role 字段，
-// 其余字段原样透传；无 developer 时返回原 body 不做重序列化。
-func normalizeDeveloperRoles(body []byte) []byte {
+// MaxOutputTokens 是 codearts 上游的 max_tokens 归一值。实测（2026-11-21）：
+// 上游严格按 max_tokens 截断——带 64 时 finish_reason=length 且正文为空；
+// Qoder 常带 8192，长回答会在 8192 处被截（前端报「回答未完成」）。131072 与
+// 1,000,000 均被上游接受（内部自有过长保护），取 128K 作为统一上限。
+const MaxOutputTokens int64 = 131072
+
+// normalizeRequestBody 是 codearts 出站体的归一化：
+//  1. messages 里的 developer 改写为 system（上游 role 枚举只认
+//     system/assistant/user/tool/function；Codex responses 协议翻译会产出
+//     developer，codearts 对非法 role 表现为空流）；
+//  2. max_tokens 钉到 MaxOutputTokens（小值截断、超值收紧，非正/非整数不动）。
+//
+// 无改动时返回原 body，不做重序列化。
+func normalizeRequestBody(body []byte) []byte {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body
 	}
-	rawMsgs, ok := payload["messages"]
-	if !ok {
-		return body
-	}
-	var msgs []map[string]json.RawMessage
-	if err := json.Unmarshal(rawMsgs, &msgs); err != nil {
-		return body
-	}
 	changed := false
-	for _, m := range msgs {
-		var role string
-		if json.Unmarshal(m["role"], &role) == nil && role == "developer" {
-			m["role"] = json.RawMessage(`"system"`)
+	if rawTokens, okTokens := payload["max_tokens"]; okTokens {
+		var value float64
+		if json.Unmarshal(rawTokens, &value) == nil && value > 0 &&
+			value == float64(int64(value)) && int64(value) != MaxOutputTokens {
+			payload["max_tokens"] = json.RawMessage(strconv.FormatInt(MaxOutputTokens, 10))
 			changed = true
+		}
+	}
+	if rawMsgs, okMsgs := payload["messages"]; okMsgs {
+		var msgs []map[string]json.RawMessage
+		if json.Unmarshal(rawMsgs, &msgs) == nil {
+			rolesChanged := false
+			for _, m := range msgs {
+				var role string
+				if json.Unmarshal(m["role"], &role) == nil && role == "developer" {
+					m["role"] = json.RawMessage(`"system"`)
+					rolesChanged = true
+				}
+			}
+			if rolesChanged {
+				if newMsgs, errMsgs := json.Marshal(msgs); errMsgs == nil {
+					payload["messages"] = newMsgs
+					changed = true
+				}
+			}
 		}
 	}
 	if !changed {
 		return body
 	}
-	newMsgs, err := json.Marshal(msgs)
-	if err != nil {
-		return body
-	}
-	payload["messages"] = newMsgs
-	out, err := json.Marshal(payload)
-	if err != nil {
+	out, errOut := json.Marshal(payload)
+	if errOut != nil {
 		return body
 	}
 	return out

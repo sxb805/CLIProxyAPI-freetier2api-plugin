@@ -123,3 +123,41 @@ func TestChatRejectsBusinessErrorIn200Body(t *testing.T) {
 		t.Fatalf("message 应保留上游原文并给出可操作提示: %s", failure.Msg)
 	}
 }
+
+// codearts 出站体归一：developer→system、max_tokens 钉到 MaxOutputTokens，
+// 无改动时原样返回。
+func TestNormalizeRequestBody(t *testing.T) {
+	in := `{"model":"m","max_tokens":8192,"messages":[{"role":"developer","content":"x"},{"role":"user","content":"hi"}]}`
+	out := normalizeRequestBody([]byte(in))
+	var payload struct {
+		MaxTokens int64 `json:"max_tokens"`
+		Messages  []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.MaxTokens != MaxOutputTokens {
+		t.Fatalf("max_tokens = %d, want %d", payload.MaxTokens, MaxOutputTokens)
+	}
+	if payload.Messages[0].Role != "system" {
+		t.Fatalf("developer 未归一: %q", payload.Messages[0].Role)
+	}
+
+	large := normalizeRequestBody([]byte(`{"max_tokens":1000000,"messages":[]}`))
+	var largePayload struct {
+		MaxTokens int64 `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(large, &largePayload); err != nil {
+		t.Fatalf("decode large: %v", err)
+	}
+	if largePayload.MaxTokens != MaxOutputTokens {
+		t.Fatalf("超上限未收紧: %d", largePayload.MaxTokens)
+	}
+
+	clean := `{"messages":[{"role":"user","content":"hi"}]}`
+	if string(normalizeRequestBody([]byte(clean))) != clean {
+		t.Fatal("无改动时应原样返回")
+	}
+}

@@ -316,6 +316,11 @@ const identityPrefix = identityLine + "\n\n" +
 // maxTokensFloor 是实测过的安全下限：8192（拒）与 10000（过）之间取后者。
 const maxTokensFloor = 10000
 
+// maxOutputTokens 是网关实测的 max_tokens 上限：131072 放行，262144 及以上
+// 一律 500 "parse response failed"（2026-11-21 流式/非流式双验证）。与官方模型
+// 配置里 zai_glm-5.3-flash 的 maxTokens=131072 一致。
+const maxOutputTokens = 131072
+
 // foreignIdentities 是上游按字面拦截的外来身份句 → 中性说法（长的在前：短串先
 // 命中会把长串切碎）。替换串刻意不含产品名——闸门拦的就是产品名本身。
 var foreignIdentities = [][2]string{
@@ -470,17 +475,23 @@ func indexFold(text, from string) int {
 	return -1
 }
 
-// normalizeMaxTokens 把出站体里会被上游拒收的小正整数 max_tokens 抬到下限。
+// normalizeMaxTokens 把出站体里的 max_tokens 统一归一为网关上限 131072。
 //
-// 只归一实测过被拒的形态（存在 + 正整数 + < maxTokensFloor）：缺省不注入（上游
-// 对缺省是 200，凭空注入反而改变行为），其余形态（≤0 / 非整数 / ≥ 下限 / 非数字）
-// 原样交给上游报错。max_completion_tokens 不参与该校验，一字不动。
+// 背景（2026-11-21 实测）：上游对存在且 < 10000 的正整数回 406，对 > 131072
+// 的值回 500（262144/307200/393216 全挂），131072 本身放行（流式/非流式均 200）。
+// 官方客户端发送 min(模型配置 maxTokens, 上下文-提示词估算-4096)；Qoder 固定
+// 带 8192，旧逻辑抬到 10000 导致长回答恰在 1 万 token 处 finish_reason=length
+// （前端报「回答未完成」）。这里直接钉官方上限 128K：小值抬起、超限收紧，
+// 模型自身输出长度仍是最后约束。非正整数/非整数/非数字原样交给上游报错。
+// max_completion_tokens 不参与该校验，一字不动。
 func normalizeMaxTokens(payload map[string]any) {
 	value, okValue := payload["max_tokens"].(float64)
-	if !okValue || value <= 0 || value >= maxTokensFloor || value != float64(int64(value)) {
+	if !okValue || value <= 0 || value != float64(int64(value)) {
 		return
 	}
-	payload["max_tokens"] = float64(maxTokensFloor)
+	if value != maxOutputTokens {
+		payload["max_tokens"] = float64(maxOutputTokens)
+	}
 }
 
 // envelopeError 检查业务信封 {"code","msg"}：code 存在且非 0 时返回 (code, msg, true)。

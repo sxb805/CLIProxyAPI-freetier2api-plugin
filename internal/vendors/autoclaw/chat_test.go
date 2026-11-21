@@ -49,7 +49,7 @@ func firstMessage(t *testing.T, payload map[string]any) map[string]any {
 }
 
 // TestPrepareBodyInjectsIdentityPrefixWithoutSystem 覆盖「没有 system 消息」的普通客户端：
-// 头部补一条带身份前缀的 system，model 改写生效，user 字段删除，max_tokens 抬到下限。
+// 头部补一条带身份前缀的 system，model 改写生效，user 字段删除，max_tokens 抬到网关上限。
 func TestPrepareBodyInjectsIdentityPrefixWithoutSystem(t *testing.T) {
 	payload := preparePayload(t, messagesPayload(t,
 		map[string]any{"model": "ac/glm-5.3", "max_tokens": 4096, "user": "u1"},
@@ -62,8 +62,8 @@ func TestPrepareBodyInjectsIdentityPrefixWithoutSystem(t *testing.T) {
 	if _, okUser := payload["user"]; okUser {
 		t.Fatal("user field must be removed")
 	}
-	if got := payload["max_tokens"].(float64); got != maxTokensFloor {
-		t.Fatalf("max_tokens = %v, want %d", got, maxTokensFloor)
+	if got := payload["max_tokens"].(float64); got != maxOutputTokens {
+		t.Fatalf("max_tokens = %v, want %d", got, maxOutputTokens)
 	}
 	first := firstMessage(t, payload)
 	if first["role"] != "system" {
@@ -183,7 +183,7 @@ func TestPrepareBodyReplacesEmptySystemContent(t *testing.T) {
 	}
 }
 
-// TestPrepareBodyNormalizesMaxTokens 验证只抬「存在的小正整数」：缺省不注入、
+// TestPrepareBodyNormalizesMaxTokens 验证归一「存在的正整数值」：缺省不注入、
 // 非正整数与 max_completion_tokens 一律不动。
 func TestPrepareBodyNormalizesMaxTokens(t *testing.T) {
 	cases := []struct {
@@ -192,10 +192,10 @@ func TestPrepareBodyNormalizesMaxTokens(t *testing.T) {
 		want  any // nil 表示该字段不应出现
 	}{
 		{name: "缺省不注入", extra: map[string]any{}},
-		{name: "小值抬到下限", extra: map[string]any{"max_tokens": 16}, want: float64(maxTokensFloor)},
-		{name: "8192 抬到下限", extra: map[string]any{"max_tokens": 8192}, want: float64(maxTokensFloor)},
-		{name: "恰在下限保留", extra: map[string]any{"max_tokens": 10000}, want: float64(10000)},
-		{name: "超过下限保留", extra: map[string]any{"max_tokens": 12000}, want: float64(12000)},
+		{name: "小值抬到上限", extra: map[string]any{"max_tokens": 16}, want: float64(maxOutputTokens)},
+		{name: "8192 抬到上限", extra: map[string]any{"max_tokens": 8192}, want: float64(maxOutputTokens)},
+		{name: "恰在上限保留", extra: map[string]any{"max_tokens": 131072}, want: float64(131072)},
+		{name: "超上限收紧", extra: map[string]any{"max_tokens": 307200}, want: float64(maxOutputTokens)},
 		{name: "零不动", extra: map[string]any{"max_tokens": 0}, want: float64(0)},
 		{name: "负数不动", extra: map[string]any{"max_tokens": -1}, want: float64(-1)},
 		{name: "非整数不动", extra: map[string]any{"max_tokens": 1024.5}, want: float64(1024.5)},
