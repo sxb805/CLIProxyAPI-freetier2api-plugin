@@ -418,8 +418,16 @@ func (v *adapter) startLoginCatcher(state string) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, errComplete := v.completeLogin(ctx, sessionID, code); errComplete != nil {
+		result, errComplete := v.completeLogin(ctx, sessionID, code)
+		if errComplete != nil {
 			return "", errComplete
+		}
+		// 凭证必须在这里落盘：completeLogin 只换票不保存，此前返回值被丢弃——
+		// 浏览器显示「登录成功」但账号从未写入宿主，会话又被消费，用户再走
+		// 粘贴兜底只会撞「会话不存在」（2026-11-22 二号登录四连失败实锤）。
+		// 空 callbackID = 后台任务语义，与保活写回同路径。
+		if _, errSave := hostbridge.SaveAuth("", result.Auth.FileName, []byte(result.Auth.StorageJSON)); errSave != nil {
+			return "", fmt.Errorf("凭证写回失败，请把回调链接粘回控制台兜底：%v", errSave)
 		}
 		return "小浣熊登录成功", nil
 	})
@@ -432,7 +440,9 @@ func (v *adapter) startLoginCatcher(state string) {
 func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
 	session, pollState := v.Env.Logins.Poll(strings.TrimSpace(state))
 	if pollState == core.PollMissing {
-		return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
+		return nil, core.NewPluginError("session_not_found",
+			"登录会话不存在或已过期。若浏览器回调页已显示「登录成功」，账号其实已添加，关闭本窗口回账号列表查看即可；"+
+				"否则请重新发起登录", http.StatusNotFound)
 	}
 	pending, okPending := session.Data.(*PendingLogin)
 	if !okPending {
