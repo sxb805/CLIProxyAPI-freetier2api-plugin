@@ -15,6 +15,7 @@ package raccoon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -245,51 +246,70 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	}, nil
 }
 
-// Checkin 领取一次性的桌面端登录奖励（幂等）。
+// Checkin 领取小浣熊积分权益：每日积分（GET setting_info 触发服务端发放，
+// 服务端按天幂等）+ 一次性桌面端登录奖励（每号一次，幂等）。
 //
-// 注意：小浣熊**没有每日签到端点**——每日积分由服务端自动发放。这条只是
-// 官方桌面端登录弹窗的一次性领取，每日任务入口已由 SupportsCheckinFor 关掉；
-// 手动触发时「已领过」按幂等命中（Already）上报，而不是记成失败。
+// 两条链路独立且都幂等：每日积分当天已发时 granted=false（不是错误）；
+// 桌面奖励已领过时返回 ErrCheckinNotGranted。任一条失败不算整体失败，
+// 另一条已拿到的权益照实上报。并入签到链路的动机见 SupportsCheckinFor 注释。
 func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
 	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
-	granted, credit, errGrant := ClaimDailyGrant(ctx, v.resolveOrigin(), native)
-	if errGrant != nil {
-		if errGrant == ErrCheckinNotGranted {
-			return &core.CheckinResult{
-				Already: true,
-				Message: "该账号已领取过桌面端登录奖励（每号一次）",
-			}, nil
-		}
-		return nil, core.ToPluginError(errGrant)
+	var total int64
+	var parts []string
+	progress := false
+
+	// 每日积分（GET 只读触发，服务端按天幂等：当天已发时回空 popups）
+	dailyGranted, dailyCredit, errDaily := DailyGrantViaSetting(ctx, v.resolveOrigin(), native)
+	if errDaily != nil {
+		return nil, core.ToPluginError(errDaily)
 	}
-	if !granted {
+	if dailyGranted {
+		progress = true
+		if dailyCredit > 0 {
+			total += dailyCredit
+			parts = append(parts, fmt.Sprintf("每日积分 +%d", dailyCredit))
+		} else {
+			parts = append(parts, "每日积分已发放")
+		}
+	}
+
+	// 一次性桌面登录奖励（每号一次；已领过返回 ErrCheckinNotGranted）
+	deskGranted, deskCredit, errDesk := ClaimDailyGrant(ctx, v.resolveOrigin(), native)
+	if errDesk != nil && !errors.Is(errDesk, ErrCheckinNotGranted) {
+		return nil, core.ToPluginError(errDesk)
+	}
+	if deskGranted {
+		progress = true
+		if deskCredit > 0 {
+			total += deskCredit
+			parts = append(parts, fmt.Sprintf("桌面登录奖励 +%d", deskCredit))
+		} else {
+			parts = append(parts, "桌面登录奖励已领取")
+		}
+	}
+
+	if !progress {
 		return &core.CheckinResult{
 			Already: true,
-			Message: "该账号已领取过桌面端登录奖励（每号一次）",
+			Message: "今日每日积分已发放；桌面登录奖励已领取过（每号一次）",
 		}, nil
 	}
-	message := "登录奖励领取成功（一次性）"
-	if credit > 0 {
-		message = fmt.Sprintf("登录奖励领取成功 +%d 积分（一次性）", credit)
-	}
-	return &core.CheckinResult{Credit: credit, Message: message}, nil
+	return &core.CheckinResult{Credit: total, Message: strings.Join(parts, "；")}, nil
 }
 
 func (v *adapter) SupportsCheckin() bool { return true }
 
-// SupportsCheckinFor 报告该账号是否支持「每日签到」。
+// SupportsCheckinFor 报告该账号支持签到：每日积分（setting_info 触发）与
+// 一次性桌面奖励都经本链路领取。
 //
-// 小浣熊没有每日签到端点：每日积分由服务端自动发放，客户端只有一次性的
-// 桌面端登录奖励。把它登记成签到会让每个账号每天产生一条失败历史。
-func (v *adapter) SupportsCheckinFor(_ *core.Credential) bool { return false }
-
-// CheckinUnsupportedReason 返回不可签到的可读原因。
-func (v *adapter) CheckinUnsupportedReason(_ *core.Credential) string {
-	return "小浣熊没有每日签到；桌面端登录奖励为一次性领取"
-}
+// 历史背景：此前返回 false，理由是「小浣熊没有每日签到端点，登记成签到会
+// 每天产生失败历史」。但每日积分挂在独立的 8:00 排程且无手动触发入口——
+// Mac 休眠错过槽点后当天无法补救（2026-11-21/22 连续两天实测错过）。改为
+// 并入签到链路：一键签到与 9/10/21 排程都会触发；两条接口都幂等，重复
+// 调用无重复发放风险（每日积分服务端按天状态位，桌面奖励每号一次）。
 
 // TaskSpecs 实现 core.TaskCatalogProvider：注册「每日积分」任务族。
 //
@@ -530,7 +550,6 @@ var (
 	_ core.Vendor               = (*adapter)(nil)
 	_ core.CallbackSubmitter    = (*adapter)(nil)
 	_ core.CheckinProvider      = (*adapter)(nil)
-	_ core.CheckinCapability    = (*adapter)(nil)
 	_ core.Configurable         = (*adapter)(nil)
 	_ core.ConfigFieldsProvider = (*adapter)(nil)
 	_ core.CreditsProvider      = (*adapter)(nil)
